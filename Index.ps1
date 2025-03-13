@@ -335,9 +335,9 @@ if (-not $Parallel) {
 
     # Check failed sub-threads
     if ($Jobs.State -eq 'Failed') {
-      Write-Log -Object 'An error occurred in the following sub-threads:' -Level Error
       $Jobs | Where-Object -Property 'State' -EQ -Value 'Failed' | ForEach-Object -Process {
-        Write-Log -Object "$($_.Name): $($_.JobStateInfo.Reason.Message)" -Level Error
+        Write-Log -Object "An error occurred in the following sub-thread $($_.Name):" -Level Error
+        $_.JobStateInfo.Reason.ErrorRecord | Out-Host
       }
     }
 
