@@ -307,7 +307,11 @@ if ($Parallel -or $ThrottleLimit -eq 1) {
     }
 
     # Pass the task objects to output if enabled
-    if ($PassThru) { Write-Output -InputObject $Task }
+    if ($PassThru) {
+      Write-Output -InputObject $Task
+    } else {
+      $Task.Dispose()
+    }
   }
 
   Write-Log -Object 'Done' -Level Verbose
