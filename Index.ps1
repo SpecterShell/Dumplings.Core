@@ -30,8 +30,6 @@
 #>
 
 #Requires -Version 7.4
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'DumplingsDefaultParameterValues', Justification = 'This variable is shared across scripts')]
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'PSNativeCommandUseErrorActionPreference', Justification = 'This is a built-in variable of PowerShell')]
 
 [CmdletBinding()]
 param (
@@ -117,20 +115,6 @@ function Write-Log {
 # Set up Write-Log identifier
 $Script:DumplingsLogIdentifier = @('Dumplings')
 
-# Set default parameter values for some functions
-$PSDefaultParameterValues = $Global:DumplingsDefaultParameterValues = @{
-  'Invoke-WebRequest:ConnectionTimeoutSeconds' = 15
-  'Invoke-WebRequest:OperationTimeoutSeconds'  = 15
-  'Invoke-WebRequest:MaximumRetryCount'        = 3
-  'Invoke-WebRequest:RetryIntervalSec'         = 3
-  'Invoke-WebRequest:SslProtocol'              = 'Tls12'
-  'Invoke-RestMethod:ConnectionTimeoutSeconds' = 15
-  'Invoke-RestMethod:OperationTimeoutSeconds'  = 15
-  'Invoke-RestMethod:MaximumRetryCount'        = 3
-  'Invoke-RestMethod:RetryIntervalSec'         = 3
-  'Invoke-RestMethod:SslProtocol'              = 'Tls12'
-}
-
 if (-not $Parallel) {
   # Set console input and output encoding to UTF-8. This will also affect sub-threads
   $Private:OldOutputEncoding = [System.Console]::OutputEncoding
@@ -203,6 +187,17 @@ if (-not $Parallel) {
     }
   }
 
+  # Load default parameter values from the preferences
+  $Global:DumplingsDefaultParameterValues = $null
+  if ($Global:DumplingsPreference.Contains('DefaultParameterValues')) {
+    try {
+      $Global:DumplingsDefaultParameterValues = [System.Management.Automation.DefaultParameterDictionary]$Global:DumplingsPreference.DefaultParameterValues
+      if ($Global:DumplingsDefaultParameterValues) { $PSDefaultParameterValues = $Global:DumplingsDefaultParameterValues }
+    } catch {
+      Write-Log -Object "Failed to load default parameter values: ${_}" -Level Warning
+    }
+  }
+
   # Install specified PowerShell modules
   if ($Global:DumplingsPreference.Contains('PowerShellModules') -and $Global:DumplingsPreference.PowerShellModules -is [System.Collections.IEnumerable]) {
     $Global:DumplingsPreference.PowerShellModules | ForEach-Object -Process {
@@ -264,10 +259,14 @@ if ($Parallel -or $ThrottleLimit -eq 1) {
     $TaskNamesTotalCount = $using:TaskNamesTotalCount
     $Global:DumplingsPreference = $using:DumplingsPreference
     $Global:DumplingsSecret = $using:DumplingsSecret
+    $Global:DumplingsDefaultParameterValues = $using:DumplingsDefaultParameterValues
     $Global:DumplingsStorage = $using:DumplingsStorage
     $Global:DumplingsCache = $using:DumplingsCache
     $Global:DumplingsOutput = $using:DumplingsOutput
   }
+
+  # Apply default parameter values
+  if ($Global:DumplingsDefaultParameterValues) { $PSDefaultParameterValues = $Global:DumplingsDefaultParameterValues }
 
   # Import modules
   $Private:ModulePath = Join-Path $Global:DumplingsRoot 'Modules'
