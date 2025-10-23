@@ -227,7 +227,7 @@ if (-not $Parallel) {
 
   # Set up output folder for tasks
   $Global:DumplingsOutput = (New-Item -Path $PWD -Name 'Outputs' -ItemType Directory -Force).FullName
-  Get-ChildItem $Global:DumplingsOutput | Remove-Item -Recurse -Force
+  Get-ChildItem $Global:DumplingsOutput | Remove-Item -Recurse -Force -ProgressAction 'SilentlyContinue'
 
   # Switch to multi-threads mode if the number of threads is set to be greater than 1, otherwise stay in single-thread mode
   if ($ThrottleLimit -gt 1) {
@@ -365,6 +365,6 @@ if (-not $Parallel) {
   # Clean and restore the environment for the main thread
   [System.Console]::OutputEncoding = $Private:OldOutputEncoding
   [System.Console]::InputEncoding = $Private:OldInputEncoding
-  Remove-Item -Path $Global:DumplingsCache -Recurse -Force -ErrorAction Continue
+  Remove-Item -Path $Global:DumplingsCache -Recurse -Force -ErrorAction 'Continue' -ProgressAction 'SilentlyContinue'
   Set-StrictMode -Off
 }
