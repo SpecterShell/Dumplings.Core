@@ -223,7 +223,7 @@ if (-not $Parallel) {
   $Global:DumplingsStorage = [ordered]@{}
 
   # Set up temp folder for tasks
-  $Global:DumplingsCache = (New-Item -Path $Env:TEMP -Name 'Dumplings' -ItemType Directory -Force).FullName
+  $Global:DumplingsCache = (New-Item -Path $Env:TEMP -Name "Dumplings-$(Get-Random)" -ItemType Directory -Force).FullName
 
   # Set up output folder for tasks
   $Global:DumplingsOutput = (New-Item -Path $PWD -Name 'Outputs' -ItemType Directory -Force).FullName
