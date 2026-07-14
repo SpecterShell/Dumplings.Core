@@ -116,6 +116,25 @@ function Write-Log {
 $Script:DumplingsLogIdentifier = @('Dumplings')
 
 if (-not $Parallel) {
+  # Load environmental variables from the .env file without overriding existing ones
+  $Private:DotEnvPath = Join-Path $PWD '.env'
+  if (Test-Path -LiteralPath $Private:DotEnvPath -PathType Leaf) {
+    foreach ($DotEnvLine in (Get-Content -LiteralPath $Private:DotEnvPath)) {
+      if ($DotEnvLine -cnotmatch '^\s*(?:export\s+)?(?<Name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?<Value>.*)$') { continue }
+
+      $DotEnvName = $Matches.Name
+      if (Test-Path -LiteralPath "Env:${DotEnvName}") { continue }
+
+      $DotEnvValue = $Matches.Value.Trim()
+      if ($DotEnvValue.Length -ge 2 -and (($DotEnvValue.StartsWith("'") -and $DotEnvValue.EndsWith("'")) -or ($DotEnvValue.StartsWith('"') -and $DotEnvValue.EndsWith('"')))) {
+        $DotEnvValue = $DotEnvValue.Substring(1, $DotEnvValue.Length - 2)
+      } else {
+        $DotEnvValue = ($DotEnvValue -split '\s+#', 2)[0].TrimEnd()
+      }
+      Set-Item -LiteralPath "Env:${DotEnvName}" -Value $DotEnvValue
+    }
+  }
+
   # Set console input and output encoding to UTF-8. This will also affect sub-threads
   $Private:OldOutputEncoding = [System.Console]::OutputEncoding
   $Private:OldInputEncoding = [System.Console]::InputEncoding
