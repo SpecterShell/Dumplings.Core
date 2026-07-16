@@ -58,9 +58,12 @@ param (
   [System.Collections.IEnumerable]$Params = @()
 )
 
-# Load runner infrastructure before the main thread builds shared state.
-Import-Module (Join-Path $PSScriptRoot 'TaskDependency.psm1') -Force
-Import-Module (Join-Path $PSScriptRoot 'WorkerState.psm1') -Force
+# Worker jobs receive the resolved plan and shared state from the coordinator.
+# Only the coordinator needs the runner infrastructure modules.
+if (-not $Parallel) {
+  Import-Module (Join-Path $PSScriptRoot 'TaskDependency.psm1') -Force
+  Import-Module (Join-Path $PSScriptRoot 'WorkerState.psm1') -Force
+}
 
 # Enable strict mode to avoid non-existent or empty properties from the API
 Set-StrictMode -Version 3.0
@@ -318,7 +321,8 @@ if ($Parallel -or $ThrottleLimit -eq 1) {
   $TaskName = [string]$null
   while ($TaskNames.TryDequeue([ref]$TaskName)) {
     # Progress records can be dropped or delayed. Keep authoritative timeout evidence in shared memory instead.
-    Write-DumplingsWokTask -Tracker $WokTaskTracker -WokName $WokName -TaskName $TaskName
+    # Write directly because module-exported commands are not guaranteed to remain visible in a ThreadJob script scope.
+    $WokTaskTracker[$WokName] = $TaskName
 
     # Print a progress bar with a perecentage and the name of the current task
     Write-Progress -Id 0 -Activity 'Dumplings' -PercentComplete (100 - $TaskNames.Count / $TaskNamesTotalCount * 100) -CurrentOperation $TaskName -Status "$($TaskNamesTotalCount - $TaskNames.Count)/$($TaskNamesTotalCount) $TaskName"
