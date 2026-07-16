@@ -2,7 +2,7 @@
 .SYNOPSIS
   A bootstrapping script to build and run tasks, in either single-thread mode or multi-threads mode
 .PARAMETER Name
-  The names of the tasks to run. Leave blank to run all tasks
+  The names of the tasks to run. Tasks declared through DependsOn in Config.yaml are included automatically. Leave blank to run all tasks
 .PARAMETER Path
   The path to the folder containing the task files
 .PARAMETER PassThru
@@ -57,6 +57,9 @@ param (
   [Parameter(Position = 6, ValueFromRemainingArguments, HelpMessage = 'Additional parameters to be passed to the model instances')]
   [System.Collections.IEnumerable]$Params = @()
 )
+
+# Load task dependency discovery before the main thread builds the shared plan.
+Import-Module (Join-Path $PSScriptRoot 'TaskDependency.psm1') -Force
 
 # Enable strict mode to avoid non-existent or empty properties from the API
 Set-StrictMode -Version 3.0
@@ -232,14 +235,25 @@ if (-not $Parallel) {
   if (-not (Test-Path -Path $Path)) {
     throw "The task directory `"${Path}`" does not exist. Please check the path or specify another one."
   }
-  [System.Collections.Concurrent.ConcurrentQueue[string]]$TaskNames = $Name ?
+  [string[]]$SelectedTaskNames = $Name ?
   @($Name | ForEach-Object -Process { Join-Path $Path $_ 'Config.yaml' } | Get-ChildItem -File | Select-Object -ExpandProperty Directory | Select-Object -ExpandProperty Name) :
   @(Join-Path $Path '*' 'Config.yaml' | Get-ChildItem -File | Select-Object -ExpandProperty Directory | Select-Object -ExpandProperty Name)
-  $TaskNamesTotalCount = $TaskNames.Count
-  Write-Log -Object "${TaskNamesTotalCount} task(s) found"
 
-  # Set up a shared hashtable across sub-threads
-  $Global:DumplingsStorage = [ordered]@{}
+  $TaskDependencyPlan = Resolve-DumplingsTaskDependency -TaskDirectory $Path -TaskName $SelectedTaskNames
+  $TaskDependencies = $TaskDependencyPlan.Dependencies
+  [System.Collections.Concurrent.ConcurrentQueue[string]]$TaskNames = $TaskDependencyPlan.TaskNames
+  $TaskNamesTotalCount = $TaskNames.Count
+  $DependencyTaskCount = $TaskNamesTotalCount - @($SelectedTaskNames | Sort-Object -Unique).Count
+  Write-Log -Object "${TaskNamesTotalCount} task(s) found (${DependencyTaskCount} automatic dependency task(s))"
+
+  # Set up thread-safe shared storage and task completion signals across sub-threads.
+  $Global:DumplingsStorage = [hashtable]::Synchronized(@{})
+  $TaskStates = [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+  $TaskSignals = [System.Collections.Concurrent.ConcurrentDictionary[string, System.Threading.ManualResetEventSlim]]::new([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($PlannedTaskName in $TaskDependencyPlan.TaskNames) {
+    $TaskStates[$PlannedTaskName] = 'Pending'
+    $TaskSignals[$PlannedTaskName] = [System.Threading.ManualResetEventSlim]::new($false)
+  }
 
   # Set up temp folder for tasks
   $Global:DumplingsCache = (New-Item -Path ([System.IO.Path]::GetTempPath()) -Name "Dumplings-$(Get-Random)" -ItemType Directory -Force).FullName
@@ -276,6 +290,9 @@ if ($Parallel -or $ThrottleLimit -eq 1) {
   if ($Parallel) {
     $TaskNames = $using:TaskNames
     $TaskNamesTotalCount = $using:TaskNamesTotalCount
+    $TaskDependencies = $using:TaskDependencies
+    $TaskStates = $using:TaskStates
+    $TaskSignals = $using:TaskSignals
     $Global:DumplingsPreference = $using:DumplingsPreference
     $Global:DumplingsSecret = $using:DumplingsSecret
     $Global:DumplingsDefaultParameterValues = $using:DumplingsDefaultParameterValues
@@ -299,36 +316,67 @@ if ($Parallel -or $ThrottleLimit -eq 1) {
     # Print a progress bar with a perecentage and the name of the current task
     Write-Progress -Id 0 -Activity 'Dumplings' -PercentComplete (100 - $TaskNames.Count / $TaskNamesTotalCount * 100) -CurrentOperation $TaskName -Status "$($TaskNamesTotalCount - $TaskNames.Count)/$($TaskNamesTotalCount) $TaskName"
 
-    # Build task
+    $Task = $null
     try {
-      $TaskPath = Join-Path $Path $TaskName -Resolve
-      $TaskConfig = Join-Path $TaskPath 'Config.yaml' -Resolve | Get-Item | Get-Content -Raw | ConvertFrom-Yaml -Ordered
-      $Task = New-Object -TypeName $TaskConfig.Type -ArgumentList @{
-        Name   = $TaskName
-        Path   = $TaskPath
-        Config = $TaskConfig
+      # Wait until every shared-data provider has reached a terminal state.
+      foreach ($DependencyName in $TaskDependencies[$TaskName]) {
+        $TaskSignals[$DependencyName].Wait()
       }
-    } catch {
-      Write-Log -Object "Failed to initialize the task ${TaskName}:" -Level Error
-      $_ | Out-Host
-      continue
-    }
 
-    Write-Progress -Id ($WokID + 1) -ParentId 0 -Activity "DumplingsWok${WokID}" -CurrentOperation $TaskName -Status $TaskName
+      $FailedDependencies = @($TaskDependencies[$TaskName] | Where-Object { $TaskStates[$_] -ne 'Succeeded' })
+      if ($FailedDependencies.Count -gt 0) {
+        $TaskStates[$TaskName] = 'Blocked'
+        Write-Log -Object "Skipped task ${TaskName} because dependency task(s) did not succeed: $($FailedDependencies -join ', ')" -Level Warning
+      } else {
+        $TaskStates[$TaskName] = 'Running'
 
-    # Run task
-    try {
-      $Task.Invoke()
-    } catch {
-      Write-Log -Object "An error occured in the task ${TaskName}:" -Level Error
-      $_ | Out-Host
-    }
+        # Build task
+        try {
+          $TaskPath = Join-Path $Path $TaskName -Resolve
+          $TaskConfig = Join-Path $TaskPath 'Config.yaml' -Resolve | Get-Item | Get-Content -Raw | ConvertFrom-Yaml -Ordered
+          $Task = New-Object -TypeName $TaskConfig.Type -ArgumentList @{
+            Name   = $TaskName
+            Path   = $TaskPath
+            Config = $TaskConfig
+          }
+        } catch {
+          Write-Log -Object "Failed to initialize the task ${TaskName}:" -Level Error
+          $_ | Out-Host
+        }
 
-    # Pass the task objects to output if enabled
-    if ($PassThru) {
-      Write-Output -InputObject $Task
-    } else {
-      $Task.Dispose()
+        if ($Task) {
+          Write-Progress -Id ($WokID + 1) -ParentId 0 -Activity "DumplingsWok${WokID}" -CurrentOperation $TaskName -Status $TaskName
+
+          # Run task
+          try {
+            $Task.Invoke()
+          } catch {
+            Write-Log -Object "An error occured in the task ${TaskName}:" -Level Error
+            $_ | Out-Host
+          }
+
+          if ($Task.InvocationSucceeded) {
+            $TaskStates[$TaskName] = 'Succeeded'
+          } elseif ($Task.InvocationSkipped) {
+            $TaskStates[$TaskName] = 'Skipped'
+          } else {
+            $TaskStates[$TaskName] = 'Failed'
+          }
+        } else {
+          $TaskStates[$TaskName] = 'Failed'
+        }
+      }
+    } finally {
+      $TaskSignals[$TaskName].Set()
+
+      if ($Task) {
+        # Pass the task objects to output if enabled
+        if ($PassThru) {
+          Write-Output -InputObject $Task
+        } else {
+          $Task.Dispose()
+        }
+      }
     }
   }
 
@@ -384,6 +432,7 @@ if (-not $Parallel) {
   # Clean and restore the environment for the main thread
   [System.Console]::OutputEncoding = $Private:OldOutputEncoding
   [System.Console]::InputEncoding = $Private:OldInputEncoding
+  foreach ($TaskSignal in $TaskSignals.Values) { $TaskSignal.Dispose() }
   Remove-Item -Path $Global:DumplingsCache -Recurse -Force -ErrorAction 'Continue' -ProgressAction 'SilentlyContinue'
   Set-StrictMode -Off
 }
