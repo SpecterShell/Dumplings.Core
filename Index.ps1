@@ -58,8 +58,9 @@ param (
   [System.Collections.IEnumerable]$Params = @()
 )
 
-# Load task dependency discovery before the main thread builds the shared plan.
+# Load runner infrastructure before the main thread builds shared state.
 Import-Module (Join-Path $PSScriptRoot 'TaskDependency.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'WorkerState.psm1') -Force
 
 # Enable strict mode to avoid non-existent or empty properties from the API
 Set-StrictMode -Version 3.0
@@ -246,10 +247,11 @@ if (-not $Parallel) {
   $DependencyTaskCount = $TaskNamesTotalCount - @($SelectedTaskNames | Sort-Object -Unique).Count
   Write-Log -Object "${TaskNamesTotalCount} task(s) found (${DependencyTaskCount} automatic dependency task(s))"
 
-  # Set up thread-safe shared storage and task completion signals across sub-threads.
+  # Set up thread-safe shared storage, task completion signals, and worker diagnostics across sub-threads.
   $Global:DumplingsStorage = [hashtable]::Synchronized(@{})
   $TaskStates = [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
   $TaskSignals = [System.Collections.Concurrent.ConcurrentDictionary[string, System.Threading.ManualResetEventSlim]]::new([System.StringComparer]::OrdinalIgnoreCase)
+  $WokTaskTracker = Open-DumplingsWokTaskTracker
   foreach ($PlannedTaskName in $TaskDependencyPlan.TaskNames) {
     $TaskStates[$PlannedTaskName] = 'Pending'
     $TaskSignals[$PlannedTaskName] = [System.Threading.ManualResetEventSlim]::new($false)
@@ -285,7 +287,8 @@ if ($Parallel -or $ThrottleLimit -eq 1) {
   # Set up a shared hashtable within each sub-thread
   $Global:DumplingsSessionStorage = [ordered]@{}
   # Set up Write-Log identifier
-  $Script:DumplingsLogIdentifier = @("DumplingsWok${WokID}")
+  $WokName = "DumplingsWok${WokID}"
+  $Script:DumplingsLogIdentifier = @($WokName)
   # If in sub-threads, get the shared variables from the main thread
   if ($Parallel) {
     $TaskNames = $using:TaskNames
@@ -293,6 +296,7 @@ if ($Parallel -or $ThrottleLimit -eq 1) {
     $TaskDependencies = $using:TaskDependencies
     $TaskStates = $using:TaskStates
     $TaskSignals = $using:TaskSignals
+    $WokTaskTracker = $using:WokTaskTracker
     $Global:DumplingsPreference = $using:DumplingsPreference
     $Global:DumplingsSecret = $using:DumplingsSecret
     $Global:DumplingsDefaultParameterValues = $using:DumplingsDefaultParameterValues
@@ -313,6 +317,9 @@ if ($Parallel -or $ThrottleLimit -eq 1) {
   # Build and run tasks
   $TaskName = [string]$null
   while ($TaskNames.TryDequeue([ref]$TaskName)) {
+    # Progress records can be dropped or delayed. Keep authoritative timeout evidence in shared memory instead.
+    Write-DumplingsWokTask -Tracker $WokTaskTracker -WokName $WokName -TaskName $TaskName
+
     # Print a progress bar with a perecentage and the name of the current task
     Write-Progress -Id 0 -Activity 'Dumplings' -PercentComplete (100 - $TaskNames.Count / $TaskNamesTotalCount * 100) -CurrentOperation $TaskName -Status "$($TaskNamesTotalCount - $TaskNames.Count)/$($TaskNamesTotalCount) $TaskName"
 
@@ -407,14 +414,16 @@ if (-not $Parallel) {
       }
     }
 
-    # Check running sub-threads after timeout
-    if ($Jobs.State -eq 'Running') {
+    # Snapshot running sub-threads and their last dequeued tasks before force-removing the jobs.
+    $RunningJobs = @($Jobs | Where-Object -Property 'State' -EQ -Value 'Running')
+    if ($RunningJobs.Count -gt 0) {
       Write-Log -Object "The following sub-threads exceeds the time limit of ${Timeout} second(s) and will be stopped forcibly:" -Level Warning
-      foreach ($Job in $Jobs | Where-Object -Property 'State' -EQ -Value 'Running') {
-        if ($Job.Progress -and $Job.Progress.Activity -eq $Job.Name) {
-          Write-Log -Object "$($Job.Name): $($Job.Progress.Where({ $_.Activity -eq $Job.Name }, 'Last')[-1].CurrentOperation)" -Level Warning
+      foreach ($Job in $RunningJobs) {
+        $LastTaskName = Read-DumplingsWokTask -Tracker $WokTaskTracker -WokName $Job.Name
+        if (-not [string]::IsNullOrWhiteSpace($LastTaskName)) {
+          Write-Log -Object "$($Job.Name): ${LastTaskName}" -Level Warning
         } else {
-          Write-Log -Object "$($Job.Name): The progress is not available" -Level Warning
+          Write-Log -Object "$($Job.Name): No task was dequeued before the worker stopped" -Level Warning
         }
       }
       Write-Progress -Id 0 -Activity 'Dumplings' -Completed -Status 'Stopped'
