@@ -58,9 +58,10 @@ param (
   [System.Collections.IEnumerable]$Params = @()
 )
 
-# Worker jobs receive the resolved plan and shared state from the coordinator.
-# Only the coordinator needs the runner infrastructure modules.
+# Worker jobs import the hook dispatcher after resolving the shared project root.
+# Only the coordinator needs the remaining runner infrastructure modules.
 if (-not $Parallel) {
+  Import-Module (Join-Path $PSScriptRoot 'ModuleHooks.psm1') -Force -Global
   Import-Module (Join-Path $PSScriptRoot 'TaskDependency.psm1') -Force
   Import-Module (Join-Path $PSScriptRoot 'WorkerState.psm1') -Force
 }
@@ -107,7 +108,7 @@ function Write-Log {
       'Info' { "`e[34m" } # Blue
       'Warning' { "`e[33m" } # Yellow
       'Error' { "`e[31m" } # Red
-      Default { "`e[39m" } # Default
+      default { "`e[39m" } # Default
     }
 
     if ($Identifier -and $Identifier.Where({ -not [string]::IsNullOrEmpty($_) }, 'First')) {
@@ -121,6 +122,7 @@ function Write-Log {
 
 # Set up Write-Log identifier
 $Script:DumplingsLogIdentifier = @('Dumplings')
+$RunnerStartupFailure = $null
 
 if (-not $Parallel) {
   # Load environmental variables from the .env file without overriding existing ones
@@ -235,6 +237,11 @@ if (-not $Parallel) {
     }
   }
 
+  # Discover module lifecycle hooks once. The path-only plan is safe to share with thread jobs.
+  $Global:DumplingsRoot = $PWD
+  $Private:ModulePath = Join-Path $Global:DumplingsRoot 'Modules'
+  $DumplingsModuleHookPlan = ModuleHooks\Get-DumplingsModuleHookPlan -ModulePath $Private:ModulePath
+
   # Queue the tasks to load
   if (-not (Test-Path -Path $Path)) {
     throw "The task directory `"${Path}`" does not exist. Please check the path or specify another one."
@@ -267,24 +274,62 @@ if (-not $Parallel) {
   $Global:DumplingsOutput = (New-Item -Path $PWD -Name 'Outputs' -ItemType Directory -Force).FullName
   Get-ChildItem $Global:DumplingsOutput | Remove-Item -Recurse -Force -ProgressAction 'SilentlyContinue'
 
+  $RunnerHookContext = [ordered]@{
+    RootPath      = [string]$Global:DumplingsRoot
+    ModulePath    = [string]$DumplingsModuleHookPlan.ModulePath
+    Preference    = $Global:DumplingsPreference
+    Storage       = $Global:DumplingsStorage
+    CachePath     = [string]$Global:DumplingsCache
+    OutputPath    = [string]$Global:DumplingsOutput
+    IsParallel    = $ThrottleLimit -gt 1
+    ThrottleLimit = [int]$ThrottleLimit
+    RunningJobs   = @()
+    StopReason    = 'Completed'
+    Items         = [ordered]@{}
+    HookName      = $null
+    HookPath      = $null
+  }
+  try {
+    ModuleHooks\Invoke-DumplingsModuleHook -Plan $DumplingsModuleHookPlan -Name RunnerStarting -Context $RunnerHookContext
+  } catch {
+    $RunnerStartupFailure = $_
+    $RunnerHookContext.StopReason = 'StartupFailure'
+    Write-Log -Object "A runner startup hook failed: ${_}" -Level Error
+  }
+
   # Switch to multi-threads mode if the number of threads is set to be greater than 1, otherwise stay in single-thread mode
-  if ($ThrottleLimit -gt 1) {
-    # The default number of maximum concurrent threads of ThreadJob is 5. Run Start-ThreadJob once to increase the throttle limit
-    # Add the value by 5 to allow the tasks to run ThreadJob immediately instead of waiting for the sub-threads exiting
-    $null = Start-ThreadJob -ScriptBlock {} -ThrottleLimit ($ThrottleLimit + 5) | Wait-Job
+  $Jobs = [System.Collections.Generic.List[object]]::new()
+  if (-not $RunnerStartupFailure -and $ThrottleLimit -gt 1) {
+    try {
+      # The default number of maximum concurrent threads of ThreadJob is 5. Run Start-ThreadJob once to increase the throttle limit
+      # Add the value by 5 to allow the tasks to run ThreadJob immediately instead of waiting for the sub-threads exiting
+      $null = Start-ThreadJob -ScriptBlock {} -ThrottleLimit ($ThrottleLimit + 5) | Wait-Job
 
-    Write-Log -Object "Starting ${ThrottleLimit} thread jobs"
+      Write-Log -Object "Starting ${ThrottleLimit} thread jobs"
 
-    # Re-run this script in sub-threads
-    $Jobs = 0..($ThrottleLimit - 1) | ForEach-Object -Process {
-      Start-ThreadJob -FilePath $MyInvocation.MyCommand.Definition -Name "DumplingsWok${_}" -StreamingHost $Host -ArgumentList @($Name, $Path, $PassThru, $ThrottleLimit, $true, $_, $Params)
+      # Re-run this script in sub-threads.
+      foreach ($WorkerId in 0..($ThrottleLimit - 1)) {
+        $Jobs.Add((Start-ThreadJob -FilePath $MyInvocation.MyCommand.Definition -Name "DumplingsWok${WorkerId}" -StreamingHost $Host -ArgumentList @($Name, $Path, $PassThru, $ThrottleLimit, $true, $WorkerId, $Params)))
+      }
+    } catch {
+      $RunnerStartupFailure = $_
+      $RunnerHookContext.StopReason = 'StartupFailure'
+      $RunnerHookContext.RunningJobs = @($Jobs)
+      Write-Log -Object "Failed to start Dumplings workers: ${_}" -Level Error
+      try {
+        ModuleHooks\Invoke-DumplingsModuleHook -Plan $DumplingsModuleHookPlan -Name BeforeForcedWorkerStop -Context $RunnerHookContext
+      } catch {
+        Write-Log -Object "A worker-startup cleanup hook failed: ${_}" -Level Warning
+      }
+      $Jobs | Remove-Job -Force -ErrorAction SilentlyContinue
     }
   }
 }
 
 # In single-thread mode, run tasks in the main thread directly
 # In multi-threads mode, run tasks in sub-threads, and the main thread will skip this region
-if ($Parallel -or $ThrottleLimit -eq 1) {
+$WorkerFailure = $null
+if ($Parallel -or ($ThrottleLimit -eq 1 -and -not $RunnerStartupFailure)) {
   # Set up parameters
   $Global:DumplingsRoot = $Parallel ? $using:PWD : $PWD
   # Set up a shared hashtable within each sub-thread
@@ -306,6 +351,8 @@ if ($Parallel -or $ThrottleLimit -eq 1) {
     $Global:DumplingsStorage = $using:DumplingsStorage
     $Global:DumplingsCache = $using:DumplingsCache
     $Global:DumplingsOutput = $using:DumplingsOutput
+    $DumplingsModuleHookPlan = $using:DumplingsModuleHookPlan
+    Import-Module (Join-Path $Global:DumplingsRoot 'Core' 'ModuleHooks.psm1') -Force -Global
   }
 
   # Apply default parameter values
@@ -317,135 +364,225 @@ if ($Parallel -or $ThrottleLimit -eq 1) {
     Join-Path $Private:ModulePath '*' 'Index.ps1' | Get-ChildItem -File | ForEach-Object -Process { . $_ }
   }
 
+  $WorkerHookContext = [ordered]@{
+    RootPath   = [string]$Global:DumplingsRoot
+    ModulePath = [string]$DumplingsModuleHookPlan.ModulePath
+    Preference = $Global:DumplingsPreference
+    Storage    = $Global:DumplingsStorage
+    CachePath  = [string]$Global:DumplingsCache
+    OutputPath = [string]$Global:DumplingsOutput
+    IsParallel = [bool]$Parallel
+    WorkerName = [string]$WokName
+    WorkerId   = [int]$WokID
+    Items      = [ordered]@{}
+    HookName   = $null
+    HookPath   = $null
+  }
+
   # Build and run tasks
-  $TaskName = [string]$null
-  while ($TaskNames.TryDequeue([ref]$TaskName)) {
-    # Progress records can be dropped or delayed. Keep authoritative timeout evidence in shared memory instead.
-    # Write directly because module-exported commands are not guaranteed to remain visible in a ThreadJob script scope.
-    $WokTaskTracker[$WokName] = $TaskName
+  try {
+    ModuleHooks\Invoke-DumplingsModuleHook -Plan $DumplingsModuleHookPlan -Name WorkerStarting -Context $WorkerHookContext
 
-    # Print a progress bar with a perecentage and the name of the current task
-    Write-Progress -Id 0 -Activity 'Dumplings' -PercentComplete (100 - $TaskNames.Count / $TaskNamesTotalCount * 100) -CurrentOperation $TaskName -Status "$($TaskNamesTotalCount - $TaskNames.Count)/$($TaskNamesTotalCount) $TaskName"
+    $TaskName = [string]$null
+    while ($TaskNames.TryDequeue([ref]$TaskName)) {
+      # Progress records can be dropped or delayed. Keep authoritative timeout evidence in shared memory instead.
+      # Write directly because module-exported commands are not guaranteed to remain visible in a ThreadJob script scope.
+      $WokTaskTracker[$WokName] = $TaskName
 
-    $Task = $null
-    try {
-      # Wait until every shared-data provider has reached a terminal state.
-      foreach ($DependencyName in $TaskDependencies[$TaskName]) {
-        $TaskSignals[$DependencyName].Wait()
-      }
+      # Print a progress bar with a perecentage and the name of the current task
+      Write-Progress -Id 0 -Activity 'Dumplings' -PercentComplete (100 - $TaskNames.Count / $TaskNamesTotalCount * 100) -CurrentOperation $TaskName -Status "$($TaskNamesTotalCount - $TaskNames.Count)/$($TaskNamesTotalCount) $TaskName"
 
-      $FailedDependencies = @($TaskDependencies[$TaskName] | Where-Object { $TaskStates[$_] -ne 'Succeeded' })
-      if ($FailedDependencies.Count -gt 0) {
-        $TaskStates[$TaskName] = 'Blocked'
-        Write-Log -Object "Skipped task ${TaskName} because dependency task(s) did not succeed: $($FailedDependencies -join ', ')" -Level Warning
-      } else {
-        $TaskStates[$TaskName] = 'Running'
-
-        # Build task
-        try {
-          $TaskPath = Join-Path $Path $TaskName -Resolve
-          $TaskConfig = Join-Path $TaskPath 'Config.yaml' -Resolve | Get-Item | Get-Content -Raw | ConvertFrom-Yaml -Ordered
-          $Task = New-Object -TypeName $TaskConfig.Type -ArgumentList @{
-            Name   = $TaskName
-            Path   = $TaskPath
-            Config = $TaskConfig
-          }
-        } catch {
-          Write-Log -Object "Failed to initialize the task ${TaskName}:" -Level Error
-          $_ | Out-Host
+      $Task = $null
+      try {
+        # Wait until every shared-data provider has reached a terminal state.
+        foreach ($DependencyName in $TaskDependencies[$TaskName]) {
+          $TaskSignals[$DependencyName].Wait()
         }
 
-        if ($Task) {
-          Write-Progress -Id ($WokID + 1) -ParentId 0 -Activity "DumplingsWok${WokID}" -CurrentOperation $TaskName -Status $TaskName
+        $FailedDependencies = @($TaskDependencies[$TaskName] | Where-Object { $TaskStates[$_] -ne 'Succeeded' })
+        if ($FailedDependencies.Count -gt 0) {
+          $TaskStates[$TaskName] = 'Blocked'
+          Write-Log -Object "Skipped task ${TaskName} because dependency task(s) did not succeed: $($FailedDependencies -join ', ')" -Level Warning
+        } else {
+          $TaskStates[$TaskName] = 'Running'
 
-          # Run task
+          # Build task
           try {
-            $Task.Invoke()
+            $TaskPath = Join-Path $Path $TaskName -Resolve
+            $TaskConfig = Join-Path $TaskPath 'Config.yaml' -Resolve | Get-Item | Get-Content -Raw | ConvertFrom-Yaml -Ordered
+            $Task = New-Object -TypeName $TaskConfig.Type -ArgumentList @{
+              Name   = $TaskName
+              Path   = $TaskPath
+              Config = $TaskConfig
+            }
           } catch {
-            Write-Log -Object "An error occured in the task ${TaskName}:" -Level Error
+            Write-Log -Object "Failed to initialize the task ${TaskName}:" -Level Error
             $_ | Out-Host
           }
 
-          if ($Task.InvocationSucceeded) {
-            $TaskStates[$TaskName] = 'Succeeded'
-          } elseif ($Task.InvocationSkipped) {
-            $TaskStates[$TaskName] = 'Skipped'
+          if ($Task) {
+            Write-Progress -Id ($WokID + 1) -ParentId 0 -Activity "DumplingsWok${WokID}" -CurrentOperation $TaskName -Status $TaskName
+
+            $TaskHookContext = [ordered]@{
+              RootPath        = [string]$Global:DumplingsRoot
+              ModulePath      = [string]$DumplingsModuleHookPlan.ModulePath
+              Preference      = $Global:DumplingsPreference
+              Storage         = $Global:DumplingsStorage
+              CachePath       = [string]$Global:DumplingsCache
+              OutputPath      = [string]$Global:DumplingsOutput
+              IsParallel      = [bool]$Parallel
+              WorkerName      = [string]$WokName
+              WorkerId        = [int]$WokID
+              Task            = $Task
+              TaskName        = [string]$TaskName
+              InvocationId    = [guid]::NewGuid().ToString('N')
+              InvocationError = $null
+              Items           = [ordered]@{}
+              HookName        = $null
+              HookPath        = $null
+            }
+            try {
+              ModuleHooks\Invoke-DumplingsModuleHook -Plan $DumplingsModuleHookPlan -Name BeforeTask -Context $TaskHookContext
+              $Task.Invoke()
+            } catch {
+              $Task.InvocationSucceeded = $false
+              $Task.InvocationSkipped = $false
+              $TaskHookContext.InvocationError = $_
+              Write-Log -Object "A task lifecycle operation failed for ${TaskName}:" -Level Error
+              $_ | Out-Host
+            } finally {
+              try {
+                ModuleHooks\Invoke-DumplingsModuleHook -Plan $DumplingsModuleHookPlan -Name AfterTask -Context $TaskHookContext
+              } catch {
+                $Task.InvocationSucceeded = $false
+                $Task.InvocationSkipped = $false
+                if (-not $TaskHookContext.InvocationError) { $TaskHookContext.InvocationError = $_ }
+                Write-Log -Object "A task cleanup hook failed for ${TaskName}: ${_}" -Level Error
+              }
+            }
+
+            if ($Task.InvocationSucceeded) {
+              $TaskStates[$TaskName] = 'Succeeded'
+            } elseif ($Task.InvocationSkipped) {
+              $TaskStates[$TaskName] = 'Skipped'
+            } else {
+              $TaskStates[$TaskName] = 'Failed'
+            }
           } else {
             $TaskStates[$TaskName] = 'Failed'
           }
-        } else {
-          $TaskStates[$TaskName] = 'Failed'
         }
-      }
-    } finally {
-      $TaskSignals[$TaskName].Set()
+      } finally {
+        $TaskSignals[$TaskName].Set()
 
-      if ($Task) {
-        # Pass the task objects to output if enabled
-        if ($PassThru) {
-          Write-Output -InputObject $Task
-        } else {
-          $Task.Dispose()
+        if ($Task) {
+          # Pass the task objects to output if enabled
+          if ($PassThru) {
+            Write-Output -InputObject $Task
+          } else {
+            $Task.Dispose()
+          }
         }
       }
     }
+
+    Write-Log -Object 'Done' -Level Verbose
+  } catch {
+    $WorkerFailure = $_
+  } finally {
+    try {
+      ModuleHooks\Invoke-DumplingsModuleHook -Plan $DumplingsModuleHookPlan -Name WorkerStopping -Context $WorkerHookContext
+    } catch {
+      if ($WorkerFailure) {
+        Write-Log -Object "A worker cleanup hook failed after another worker error: ${_}" -Level Warning
+      } else {
+        $WorkerFailure = $_
+      }
+    }
+
+    # Unload task modules while retaining Core infrastructure for coordinator cleanup in single-thread mode.
+    $TaskModuleRoot = (Join-Path $Global:DumplingsRoot 'Modules').TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    Get-Module | Where-Object -FilterScript {
+      $_.Path.StartsWith($TaskModuleRoot, [StringComparison]::OrdinalIgnoreCase) -and -not $_.Name.Contains('oh-my-posh')
+    } | Remove-Module
   }
 
-  Write-Log -Object 'Done' -Level Verbose
-
-  # Clean the environment for the sub-thread
-  Get-Module | Where-Object -FilterScript { $_.Path.Contains($Global:DumplingsRoot) -and -not $_.Name.Contains('oh-my-posh') } | Remove-Module
+  if ($Parallel -and $WorkerFailure) { throw $WorkerFailure }
 }
 
 # Set up Write-Log identifier
 $Script:DumplingsLogIdentifier = @('Dumplings')
 
 if (-not $Parallel) {
-  # In multi-threads mode, let the main thread wait for all sub-threads first
-  if ($ThrottleLimit -gt 1) {
-    # Read the timeout from the preference or use the default value - 50 minutes
-    $NewTimeout = [int]$null
-    $Timeout = $Global:DumplingsPreference.Contains('Timeout') -and [int]::TryParse($Global:DumplingsPreference.Timeout, [ref]$NewTimeout) ? $NewTimeout : 3000
+  $CoordinatorFailure = $null
+  try {
+    # In multi-threads mode, let the main thread wait for all sub-threads first.
+    if (-not $RunnerStartupFailure -and $ThrottleLimit -gt 1) {
+      # Read the timeout from the preference or use the default value - 50 minutes.
+      $NewTimeout = [int]$null
+      $Timeout = $Global:DumplingsPreference.Contains('Timeout') -and [int]::TryParse($Global:DumplingsPreference.Timeout, [ref]$NewTimeout) ? $NewTimeout : 3000
 
-    # Wait for all threads with the specified timeout
-    $null = $Jobs | Wait-Job -Timeout $Timeout
+      # Wait for all threads with the specified timeout
+      $null = $Jobs | Wait-Job -Timeout $Timeout
 
-    # Check failed sub-threads
-    if ($Jobs.State -eq 'Failed') {
-      $Jobs | Where-Object -Property 'State' -EQ -Value 'Failed' | ForEach-Object -Process {
-        Write-Log -Object "An error occurred in the sub-thread $($_.Name):" -Level Error
-        $_.JobStateInfo.Reason.ErrorRecord | Out-Host
-      }
-    }
-
-    # Snapshot running sub-threads and their last dequeued tasks before force-removing the jobs.
-    $RunningJobs = @($Jobs | Where-Object -Property 'State' -EQ -Value 'Running')
-    if ($RunningJobs.Count -gt 0) {
-      Write-Log -Object "The following sub-threads exceeds the time limit of ${Timeout} second(s) and will be stopped forcibly:" -Level Warning
-      foreach ($Job in $RunningJobs) {
-        $LastTaskName = Read-DumplingsWokTask -Tracker $WokTaskTracker -WokName $Job.Name
-        if (-not [string]::IsNullOrWhiteSpace($LastTaskName)) {
-          Write-Log -Object "$($Job.Name): ${LastTaskName}" -Level Warning
-        } else {
-          Write-Log -Object "$($Job.Name): No task was dequeued before the worker stopped" -Level Warning
+      # Check failed sub-threads
+      if ($Jobs.State -eq 'Failed') {
+        $RunnerHookContext.StopReason = 'WorkerFailure'
+        $Jobs | Where-Object -Property 'State' -EQ -Value 'Failed' | ForEach-Object -Process {
+          Write-Log -Object "An error occurred in the sub-thread $($_.Name):" -Level Error
+          $_.JobStateInfo.Reason.ErrorRecord | Out-Host
         }
       }
-      Write-Progress -Id 0 -Activity 'Dumplings' -Completed -Status 'Stopped'
-    } else {
-      Write-Progress -Id 0 -Activity 'Dumplings' -Completed -Status 'Completed'
+
+      # Snapshot running sub-threads and their last dequeued tasks before force-removing the jobs.
+      $RunningJobs = @($Jobs | Where-Object -Property 'State' -EQ -Value 'Running')
+      if ($RunningJobs.Count -gt 0) {
+        $RunnerHookContext.RunningJobs = $RunningJobs
+        $RunnerHookContext.StopReason = 'Timeout'
+        Write-Log -Object "The following sub-threads exceeds the time limit of ${Timeout} second(s) and will be stopped forcibly:" -Level Warning
+        foreach ($Job in $RunningJobs) {
+          $LastTaskName = Read-DumplingsWokTask -Tracker $WokTaskTracker -WokName $Job.Name
+          if (-not [string]::IsNullOrWhiteSpace($LastTaskName)) {
+            Write-Log -Object "$($Job.Name): ${LastTaskName}" -Level Warning
+          } else {
+            Write-Log -Object "$($Job.Name): No task was dequeued before the worker stopped" -Level Warning
+          }
+        }
+        Write-Progress -Id 0 -Activity 'Dumplings' -Completed -Status 'Stopped'
+        try {
+          ModuleHooks\Invoke-DumplingsModuleHook -Plan $DumplingsModuleHookPlan -Name BeforeForcedWorkerStop -Context $RunnerHookContext
+        } catch {
+          Write-Log -Object "A forced-worker-stop hook failed: ${_}" -Level Warning
+        }
+      } else {
+        Write-Progress -Id 0 -Activity 'Dumplings' -Completed -Status 'Completed'
+      }
+
+      # Pass the task objects to output if enabled
+      if ($PassThru) { $Jobs | Receive-Job }
+
+      # Force remove the jobs
+      $Jobs | Remove-Job -Force
+    }
+  } catch {
+    $CoordinatorFailure = $_
+    if ($RunnerHookContext.StopReason -eq 'Completed') { $RunnerHookContext.StopReason = 'RunnerFailure' }
+  } finally {
+    try {
+      ModuleHooks\Invoke-DumplingsModuleHook -Plan $DumplingsModuleHookPlan -Name RunnerStopping -Context $RunnerHookContext
+    } catch {
+      Write-Log -Object "A runner cleanup hook failed: ${_}" -Level Warning
     }
 
-    # Pass the task objects to output if enabled
-    if ($PassThru) { $Jobs | Receive-Job }
-
-    # Force remove the jobs
-    $Jobs | Remove-Job -Force
+    # Clean and restore the environment for the main thread.
+    [System.Console]::OutputEncoding = $Private:OldOutputEncoding
+    [System.Console]::InputEncoding = $Private:OldInputEncoding
+    foreach ($TaskSignal in $TaskSignals.Values) { $TaskSignal.Dispose() }
+    Remove-Item -Path $Global:DumplingsCache -Recurse -Force -ErrorAction 'Continue' -ProgressAction 'SilentlyContinue'
+    Set-StrictMode -Off
   }
 
-  # Clean and restore the environment for the main thread
-  [System.Console]::OutputEncoding = $Private:OldOutputEncoding
-  [System.Console]::InputEncoding = $Private:OldInputEncoding
-  foreach ($TaskSignal in $TaskSignals.Values) { $TaskSignal.Dispose() }
-  Remove-Item -Path $Global:DumplingsCache -Recurse -Force -ErrorAction 'Continue' -ProgressAction 'SilentlyContinue'
-  Set-StrictMode -Off
+  if ($RunnerStartupFailure) { throw $RunnerStartupFailure }
+  if ($WorkerFailure) { throw $WorkerFailure }
+  if ($CoordinatorFailure) { throw $CoordinatorFailure }
 }
