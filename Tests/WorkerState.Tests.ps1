@@ -1,5 +1,5 @@
 BeforeAll {
-  Import-Module (Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'WorkerState.psm1') -Force
+  Import-Module (Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'Libraries', 'WorkerState.psm1') -Force
 }
 
 Describe 'Dumplings worker task tracking' {

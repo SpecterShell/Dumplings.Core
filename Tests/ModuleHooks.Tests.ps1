@@ -1,5 +1,5 @@
 BeforeAll {
-  $Script:ModulePath = Join-Path $PSScriptRoot '..' 'ModuleHooks.psm1'
+  $Script:ModulePath = Join-Path $PSScriptRoot '..' 'Libraries' 'ModuleHooks.psm1'
   Import-Module $Script:ModulePath -Force
 
   function New-TestModuleHook {

@@ -1,5 +1,5 @@
 BeforeAll {
-  Import-Module (Join-Path $PSScriptRoot '..' 'TaskDependency.psm1') -Force
+  Import-Module (Join-Path $PSScriptRoot '..' 'Libraries' 'TaskDependency.psm1') -Force
 
   function New-TestTask {
     param (

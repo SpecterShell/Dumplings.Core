@@ -58,12 +58,16 @@ param (
   [System.Collections.IEnumerable]$Params = @()
 )
 
+# Synchronization helpers are runner infrastructure used by coordinator and worker runspaces.
+$Private:CoreLibraryPath = Join-Path $PSScriptRoot 'Libraries'
+Import-Module (Join-Path $Private:CoreLibraryPath 'Synchronization.psm1') -Force -Global
+
 # Worker jobs import the hook dispatcher after resolving the shared project root.
 # Only the coordinator needs the remaining runner infrastructure modules.
 if (-not $Parallel) {
-  Import-Module (Join-Path $PSScriptRoot 'ModuleHooks.psm1') -Force -Global
-  Import-Module (Join-Path $PSScriptRoot 'TaskDependency.psm1') -Force
-  Import-Module (Join-Path $PSScriptRoot 'WorkerState.psm1') -Force
+  Import-Module (Join-Path $Private:CoreLibraryPath 'ModuleHooks.psm1') -Force -Global
+  Import-Module (Join-Path $Private:CoreLibraryPath 'TaskDependency.psm1') -Force
+  Import-Module (Join-Path $Private:CoreLibraryPath 'WorkerState.psm1') -Force
 }
 
 # Enable strict mode to avoid non-existent or empty properties from the API
@@ -259,6 +263,8 @@ if (-not $Parallel) {
 
   # Set up thread-safe shared storage, task completion signals, and worker diagnostics across sub-threads.
   $Global:DumplingsStorage = [hashtable]::Synchronized(@{})
+  $Global:DumplingsStorage['__DumplingsWinGetSubmissionClaims'] =
+  [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
   $TaskStates = [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
   $TaskSignals = [System.Collections.Concurrent.ConcurrentDictionary[string, System.Threading.ManualResetEventSlim]]::new([System.StringComparer]::OrdinalIgnoreCase)
   $WokTaskTracker = Open-DumplingsWokTaskTracker
@@ -352,7 +358,7 @@ if ($Parallel -or ($ThrottleLimit -eq 1 -and -not $RunnerStartupFailure)) {
     $Global:DumplingsCache = $using:DumplingsCache
     $Global:DumplingsOutput = $using:DumplingsOutput
     $DumplingsModuleHookPlan = $using:DumplingsModuleHookPlan
-    Import-Module (Join-Path $Global:DumplingsRoot 'Core' 'ModuleHooks.psm1') -Force -Global
+    Import-Module (Join-Path $Global:DumplingsRoot 'Core' 'Libraries' 'ModuleHooks.psm1') -Force -Global
   }
 
   # Apply default parameter values
