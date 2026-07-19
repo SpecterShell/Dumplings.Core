@@ -143,4 +143,4 @@ Runner tests should mock external services and must not execute downloaded insta
 
 ## License
 
-Dumplings.Core is licensed under the [MIT License](LICENSE).
+Dumplings.Core is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.

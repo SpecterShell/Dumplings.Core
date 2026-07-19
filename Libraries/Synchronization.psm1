@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
 # Scoped synchronization helpers used by the Dumplings runner and task scripts.
 
 function Use-Mutex {
