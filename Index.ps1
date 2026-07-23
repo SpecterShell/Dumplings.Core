@@ -59,8 +59,12 @@ param (
 )
 
 # Synchronization helpers are runner infrastructure used by coordinator and worker runspaces.
-$Private:CoreLibraryPath = Join-Path $PSScriptRoot 'Libraries'
-Import-Module (Join-Path $Private:CoreLibraryPath 'Synchronization.psm1') -Force -Global
+# Start-ThreadJob -FilePath does not populate $PSScriptRoot in its worker invocation, so workers
+# defer this import until the shared Dumplings root has been restored below.
+$Private:CoreLibraryPath = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { $null } else { Join-Path $PSScriptRoot 'Libraries' }
+if ($Private:CoreLibraryPath) {
+  Import-Module (Join-Path $Private:CoreLibraryPath 'Synchronization.psm1') -Force -Global
+}
 
 # Worker jobs import the hook dispatcher after resolving the shared project root.
 # Only the coordinator needs the remaining runner infrastructure modules.
@@ -358,7 +362,9 @@ if ($Parallel -or ($ThrottleLimit -eq 1 -and -not $RunnerStartupFailure)) {
     $Global:DumplingsCache = $using:DumplingsCache
     $Global:DumplingsOutput = $using:DumplingsOutput
     $DumplingsModuleHookPlan = $using:DumplingsModuleHookPlan
-    Import-Module (Join-Path $Global:DumplingsRoot 'Core' 'Libraries' 'ModuleHooks.psm1') -Force -Global
+    $Private:WorkerCoreLibraryPath = Join-Path $Global:DumplingsRoot 'Core' 'Libraries'
+    Import-Module (Join-Path $Private:WorkerCoreLibraryPath 'Synchronization.psm1') -Force -Global
+    Import-Module (Join-Path $Private:WorkerCoreLibraryPath 'ModuleHooks.psm1') -Force -Global
   }
 
   # Apply default parameter values

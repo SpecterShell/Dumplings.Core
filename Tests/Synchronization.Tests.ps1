@@ -136,4 +136,15 @@ try {
 
     $Violations | Should -BeNullOrEmpty
   }
+
+  It 'loads synchronization into parallel workers before task modules' {
+    $Runner = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..' 'Index.ps1') -Raw
+    $WorkerImport = "Import-Module (Join-Path `$Private:WorkerCoreLibraryPath 'Synchronization.psm1') -Force -Global"
+    $TaskModuleImport = "Join-Path `$Private:ModulePath '*' 'Index.ps1'"
+
+    $Runner | Should -Match ([regex]::Escape("`$Private:WorkerCoreLibraryPath = Join-Path `$Global:DumplingsRoot 'Core' 'Libraries'"))
+    $Runner.IndexOf($WorkerImport, [StringComparison]::Ordinal) | Should -BeGreaterOrEqual 0
+    $Runner.IndexOf($WorkerImport, [StringComparison]::Ordinal) |
+      Should -BeLessThan $Runner.IndexOf($TaskModuleImport, [StringComparison]::Ordinal)
+  }
 }
